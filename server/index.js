@@ -93,17 +93,26 @@ app.get('/api/health', (req, res) => {
 // 2. Presence ping
 app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req, res) => {
   try {
-    const { lat, lng, device_hash } = req.body;
-    
-    if (!lat || !lng) return res.status(400).json({ error: 'Location required' });
+    let { lat, lng, device_hash } = req.body;
 
-    // 1. Calculate Search Area (Precision 5 = approx 5km radius)
-    const searchGeohash = require('ngeohash').encode(lat, lng, 5); 
+    // 1. TYPE SAFETY: Convert to numbers immediately
+    lat = parseFloat(lat);
+    lng = parseFloat(lng);
+
+    // 2. VALIDATION: Check for NaN (Invalid numbers), not just "falsy"
+    if (isNaN(lat) || isNaN(lng)) {
+        return res.status(400).json({ error: 'Valid numeric Location required' });
+    }
+
+    // 3. DEBUG LOG (Crucial for you right now)
+    const ngeohash = require('ngeohash'); // Move require out if possible, but this works
+    const searchGeohash = ngeohash.encode(lat, lng, 5);
     
-    // 2. IF REAL USER: Save location to DB (Be Visible)
+    console.log(`📡 PING: ${lat}, ${lng} -> Searching Hash: ${searchGeohash}%`);
+
+    // 4. SAVE LOCATION (If Logged In)
     if (req.user && req.user.id) {
-        // Precision 6 = approx 1km for saving exact location
-        const saveGeohash = require('ngeohash').encode(lat, lng, 6); 
+        const saveGeohash = ngeohash.encode(lat, lng, 6);
         await supabase.rpc('update_user_presence', {
           p_user_id: req.user.id,
           p_geohash: saveGeohash,
@@ -113,24 +122,27 @@ app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req,
         });
     }
 
-    // 3. FETCH NEARBY DOTS (For Everyone)
+    // 5. QUERY
     let query = supabase
       .from('user_presence')
-      .select('lat, lng') // We only need coordinates
+      .select('lat, lng, geohash') // <--- Added geohash for debug visibility
       .eq('is_online', true)
-      .like('geohash', `${searchGeohash}%`) // Find matches in the wider area
-      .limit(50); // Max dots to show
+      .like('geohash', `${searchGeohash}%`)
+      .limit(50);
 
-    // Exclude self if logged in
     if (req.user && req.user.id) {
         query = query.neq('user_id', req.user.id);
     }
 
     const { data: nearbyUsers, error } = await query;
-    if (error) throw error;
+    if (error) {
+        console.error("❌ DB Query Error:", error);
+        throw error;
+    }
 
-    // 4. PRIVACY: Fuzz the locations slightly
-    // We add random noise so guests can't track people's exact homes
+    console.log(`✅ FOUND: ${nearbyUsers?.length || 0} dots.`);
+
+    // 6. FUZZING (Safe now because we parsed floats)
     const fuzzyDots = nearbyUsers?.map(u => ({
         lat: u.lat + (Math.random() - 0.5) * 0.005, 
         lng: u.lng + (Math.random() - 0.5) * 0.005
@@ -147,7 +159,6 @@ app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req,
     res.status(500).json({ error: error.message });
   }
 });
-
 // 3. Create signal
 app.post('/api/v1/signals/create', signalLimiter, authenticate, async (req, res) => {
   try {
