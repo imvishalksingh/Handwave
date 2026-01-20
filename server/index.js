@@ -96,72 +96,68 @@ app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req,
   try {
     let { lat, lng, device_hash } = req.body;
 
-    // 1. Safety Checks
+    // 1. Safety
     lat = parseFloat(lat);
     lng = parseFloat(lng);
-    if (isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: 'Valid location required' });
-
-    // 2. Calculate Center Hash (Precision 5 = ~5km x 5km box)
-    const centerHash = ngeohash.encode(lat, lng, 5);
-    
-    // 3. GET NEIGHBORS (The Magic Fix 🪄)
-    // This gets the 8 boxes surrounding the user
-    const neighbors = ngeohash.neighbors(centerHash);
-    
-    // Combine them: We search [Center, N, NE, E, SE, S, SW, W, NW]
-    const searchHashes = [centerHash, ...neighbors];
-
-    // Debug Log
-    console.log(`📡 PING: ${lat}, ${lng}`);
-    console.log(`🔍 SEARCHING 9 GRIDS: ${searchHashes.join(', ')}`);
-
-    // 4. Update User Location (If logged in)
-    if (req.user && req.user.id) {
-        // ... (Your existing save logic is fine) ...
-        const saveGeohash = ngeohash.encode(lat, lng, 6);
-        await supabase.rpc('update_user_presence', {
-             p_user_id: req.user.id,
-             p_geohash: saveGeohash,
-             p_lat: lat,
-             p_lng: lng,
-             p_device_hash: device_hash || 'unknown'
-        });
+    if (isNaN(lat) || isNaN(lng)) {
+      return res.status(400).json({ error: 'Valid location required' });
     }
 
-    // 5. QUERY (Using the .or() filter for neighbors)
+    // 2. Geohash search (MATCH stored precision)
+    const precision = 6;
+    const centerHash = ngeohash.encode(lat, lng, precision);
+    const neighbors = ngeohash.neighbors(centerHash);
+    const searchHashes = [centerHash, ...neighbors];
+
+    console.log(`📡 PING: ${lat}, ${lng}`);
+    console.log(`🔍 SEARCHING: ${searchHashes.join(', ')}`);
+
+    if (!searchHashes.length) {
+      return res.json({
+        success: true,
+        is_guest: !req.user,
+        nearby_dots: []
+      });
+    }
+
+    // 3. Save location if logged in
+    if (req.user?.id) {
+      await supabase.rpc('update_user_presence', {
+        p_user_id: req.user.id,
+        p_geohash: centerHash,
+        p_lat: lat,
+        p_lng: lng,
+        p_device_hash: device_hash || 'unknown'
+      });
+    }
+
+    // 4. Query neighbors
     let query = supabase
       .from('user_presence')
       .select('lat, lng, geohash')
       .eq('is_online', true)
-      // This creates a filter like: geohash.like.abc%,geohash.like.def%,...
-      .or(
-         searchHashes.map(h => `geohash.like.${h}%`).join(',')
-      )
+      .or(searchHashes.map(h => `geohash.like.${h}%`).join(','))
       .limit(50);
 
-    // Exclude self
-    if (req.user && req.user.id) {
-        query = query.neq('user_id', req.user.id);
+    if (req.user?.id) {
+      query = query.neq('user_id', req.user.id);
     }
 
     const { data: nearbyUsers, error } = await query;
-    if (error) {
-        console.error("❌ DB Query Error:", error);
-        throw error;
-    }
+    if (error) throw error;
 
-    console.log(`✅ FOUND: ${nearbyUsers?.length || 0} dots.`);
+    console.log(`✅ FOUND: ${nearbyUsers.length} dots`);
 
-    // 6. Fuzzing & Return
-    const fuzzyDots = nearbyUsers?.map(u => ({
-        lat: u.lat + (Math.random() - 0.5) * 0.005, 
-        lng: u.lng + (Math.random() - 0.5) * 0.005
-    })) || [];
+    // 5. Fuzzing
+    const fuzzyDots = nearbyUsers.map(u => ({
+      lat: u.lat + (Math.random() - 0.5) * 0.005,
+      lng: u.lng + (Math.random() - 0.5) * 0.005
+    }));
 
     res.json({
       success: true,
       is_guest: !req.user,
-      nearby_dots: fuzzyDots 
+      nearby_dots: fuzzyDots
     });
 
   } catch (error) {
@@ -169,6 +165,10 @@ app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req,
     res.status(500).json({ error: error.message });
   }
 });
+
+
+
+
 // 3. Create signal
 app.post('/api/v1/signals/create', signalLimiter, authenticate, async (req, res) => {
   try {
