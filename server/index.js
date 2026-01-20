@@ -466,124 +466,75 @@ app.post('/api/v1/reports/create', authenticate, async (req, res) => {
   }
 });
 
-// 10. Create user directly (for testing/admin/signup without email verification)
+// 10. Create user (Public Signup with Email Verification)
 app.post('/api/v1/users/create', async (req, res) => {
   try {
-    const { email, password, display_name, avatar_url, short_bio } = req.body;
-    
+    // 1. Accept new fields from the UI
+    const { email, password, display_name, avatar_url, short_bio, age_range, interests } = req.body;
+
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
-    
-    // 1. Create auth user in Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+
+    // 2. Use signUp() to trigger standard email verification
+    // This respects your Supabase project settings (Project Settings -> Auth -> Email -> "Enable Email Confirmations")
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email: email,
       password: password,
-      email_confirm: true, // Auto-confirm email for testing
-      user_metadata: {
-        display_name: display_name || `User_${Date.now().toString().slice(-6)}`
+      options: {
+        data: {
+          display_name: display_name || `User_${Date.now().toString().slice(-6)}`
+        }
       }
     });
-    
-    if (authError) {
-      // Check if user already exists
-      if (authError.message.includes('already registered')) {
-        // Try to sign in instead
-        const { data: signinData, error: signinError } = await supabase.auth.signInWithPassword({
-          email: email,
-          password: password
-        });
-        
-        if (signinError) throw signinError;
-        
-        // Check if profile exists
-        const { data: existingProfile } = await supabase
-          .from('users')
-          .select('*')
-          .eq('auth_id', signinData.user.id)
-          .single();
-        
-        if (existingProfile) {
-          return res.json({ 
-            success: true, 
-            user_already_exists: true,
-            user: existingProfile,
-            access_token: signinData.session.access_token 
-          });
-        }
-        
-        // Create profile for existing auth user
-        const { data: profile } = await supabase
-          .from('users')
-          .insert({
-            auth_id: signinData.user.id,
-            display_name: display_name || `User_${signinData.user.id.slice(0, 8)}`,
-            avatar_url: avatar_url,
-            short_bio: short_bio,
-            subscription_tier: 'free',
-            max_distance_meters: 1000,
-            visibility_preference: 'balanced'
-          })
-          .select()
-          .single();
-        
-        return res.json({ 
-          success: true, 
-          profile_created: true,
-          user: profile,
-          access_token: signinData.session.access_token 
-        });
-      }
-      throw authError;
+
+    if (authError) throw authError;
+
+    // Guard clause: If signUp returns no user (rare, but possible depending on config)
+    if (!authData.user) {
+        return res.status(400).json({ error: 'User creation failed' });
     }
-    
-    // 2. Create user profile in public.users table
+
+    // 3. Create profile in public.users table immediately
+    // We use 'upsert' here. If the user clicked signup twice, this updates the profile instead of crashing.
     const { data: profile, error: profileError } = await supabase
       .from('users')
-      .insert({
+      .upsert({
         auth_id: authData.user.id,
         display_name: display_name || `User_${authData.user.id.slice(0, 8)}`,
         avatar_url: avatar_url,
         short_bio: short_bio,
+        
+        // NEW FIELDS FROM UI
+        age_range: age_range,
+        interests: interests || [], 
+        
         subscription_tier: 'free',
         max_distance_meters: 1000,
         visibility_preference: 'balanced',
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      })
+      }, { onConflict: 'auth_id' })
       .select()
       .single();
-    
+
     if (profileError) {
-      // If profile creation fails, delete the auth user to keep consistency
-      await supabase.auth.admin.deleteUser(authData.user.id);
+      // If the profile creation fails, we might want to log it or handle cleanup.
+      // For now, we throw to the error handler.
       throw profileError;
     }
-    
-    // 3. Generate session token for immediate use
-    const { data: sessionData, error: sessionError } = await supabase.auth.admin.generateLink({
-      type: 'magiclink',
-      email: email,
-    });
-    
-    // Alternative: Create a session manually
-    const { data: tokenData } = await supabase.auth.signInWithPassword({
-      email: email,
-      password: password
-    });
-    
+
+    // 4. Return success message (IMPORTANT: No Access Token returned)
+    // We cannot return a token because the user hasn't verified their email yet.
+    // The Frontend should show a "Check your email" screen.
     res.json({
       success: true,
+      message: 'Signup successful. Please check your email to verify your account.',
       user: profile,
-      auth_user: {
-        id: authData.user.id,
-        email: authData.user.email,
-        email_confirmed: authData.user.email_confirmed_at !== null
-      },
-      access_token: tokenData?.session?.access_token || null,
-      message: 'User created successfully. Use the access_token for authenticated requests.'
+      email_sent: true,
+      requires_verification: true
     });
-    
+
   } catch (error) {
     console.error('Create user error:', error);
     res.status(500).json({ error: error.message });
