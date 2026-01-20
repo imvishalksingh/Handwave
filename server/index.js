@@ -51,6 +51,24 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+
+const authenticateOptional = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      req.user = null; // Mark as Guest
+      return next();
+    }
+    
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    req.user = error ? null : user;
+    next();
+  } catch (error) {
+    req.user = null;
+    next();
+  }
+};
+
 // Utility functions
 const roundLocation = (lat, lng) => {
   const precision = 4; // ~100m precision
@@ -73,41 +91,57 @@ app.get('/api/health', (req, res) => {
 });
 
 // 2. Presence ping
-app.post('/api/v1/presence/ping', pingLimiter, authenticate, async (req, res) => {
+app.post('/api/v1/presence/ping', pingLimiter, authenticateOptional, async (req, res) => {
   try {
     const { lat, lng, device_hash } = req.body;
-    if (!lat || !lng) {
-      return res.status(400).json({ error: 'Location required' });
+    
+    if (!lat || !lng) return res.status(400).json({ error: 'Location required' });
+
+    // 1. Calculate Search Area (Precision 5 = approx 5km radius)
+    const searchGeohash = require('ngeohash').encode(lat, lng, 5); 
+    
+    // 2. IF REAL USER: Save location to DB (Be Visible)
+    if (req.user && req.user.id) {
+        // Precision 6 = approx 1km for saving exact location
+        const saveGeohash = require('ngeohash').encode(lat, lng, 6); 
+        await supabase.rpc('update_user_presence', {
+          p_user_id: req.user.id,
+          p_geohash: saveGeohash,
+          p_lat: lat,
+          p_lng: lng,
+          p_device_hash: device_hash || 'unknown'
+        });
     }
-    
-    const rounded = roundLocation(lat, lng);
-    const geohash = require('ngeohash').encode(rounded.lat, rounded.lng, 6);
-    
-    // Update presence
-    const { data, error } = await supabase.rpc('update_user_presence', {
-      p_user_id: req.user.id,
-      p_geohash: geohash,
-      p_lat: rounded.lat,
-      p_lng: rounded.lng,
-      p_device_hash: device_hash || 'unknown'
-    });
-    
-    if (error) throw error;
-    
-    // Get anonymous nearby count
-    const { count } = await supabase
+
+    // 3. FETCH NEARBY DOTS (For Everyone)
+    let query = supabase
       .from('user_presence')
-      .select('*', { count: 'exact', head: true })
-      .neq('user_id', req.user.id)
+      .select('lat, lng') // We only need coordinates
       .eq('is_online', true)
-      .eq('geohash', geohash);
-    
+      .like('geohash', `${searchGeohash}%`) // Find matches in the wider area
+      .limit(50); // Max dots to show
+
+    // Exclude self if logged in
+    if (req.user && req.user.id) {
+        query = query.neq('user_id', req.user.id);
+    }
+
+    const { data: nearbyUsers, error } = await query;
+    if (error) throw error;
+
+    // 4. PRIVACY: Fuzz the locations slightly
+    // We add random noise so guests can't track people's exact homes
+    const fuzzyDots = nearbyUsers?.map(u => ({
+        lat: u.lat + (Math.random() - 0.5) * 0.005, 
+        lng: u.lng + (Math.random() - 0.5) * 0.005
+    })) || [];
+
     res.json({
       success: true,
-      presence_id: data,
-      nearby_count: count || 0,
-      geohash: geohash
+      is_guest: !req.user,
+      nearby_dots: fuzzyDots 
     });
+
   } catch (error) {
     console.error('Ping error:', error);
     res.status(500).json({ error: error.message });
@@ -540,6 +574,8 @@ app.post('/api/v1/users/create', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
 
 // 10. Get user profile
 app.get('/api/v1/user/profile', authenticate, async (req, res) => {
